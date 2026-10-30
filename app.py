@@ -1,16 +1,18 @@
 """
 ====================================================================
-APLICACIÓN DE FINANZAS PERSONALES FAMILIARES - INTERFAZ MOBILE-FIRST
-- Gestión de usuarios y miembros de la familia.
-- Gastos independientes por integrante y modo 'Consolidado Familiar'.
-- Escaneo de tickets (foto/cámara) con IA y optimización de imagen.
-- Resúmenes de tarjeta de crédito (PDF/Imagen en lote).
-- Dashboard con comparativa entre miembros de la familia.
-- Sincronización automática en Excel (hojas separadas por miembro).
+FINANZAS EZY - APLICACIÓN FINANCIERA INTELIGENTE PARA FAMILIAS (2.0)
+- Autenticación individual (Cada familiar tiene su propia cuenta).
+- Espacio Personal (Privado) y Espacio Familiar (Compartido).
+- Sistema de Grupos Familiares con Código de Invitación único.
+- Escaneo de tickets con IA + Detección de gastos duplicados.
+- Resúmenes de tarjeta de crédito (PDF/Fotos en lote).
+- Dashboard con estadísticas y comparativa de aportes familiares.
+- Descarga en Excel (.xlsx) estructurado.
 ====================================================================
 """
 
 import os
+import io
 import importlib
 import streamlit as st
 import pandas as pd
@@ -31,13 +33,13 @@ load_dotenv(ENV_PATH, override=True)
 
 # Configuración de página
 st.set_page_config(
-    page_title="Finanzas Familiares",
+    page_title="Finanzas Ezy",
     page_icon="💳",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
 
-# Estilo CSS optimizado para móvil
+# Estilos CSS optimizados para móvil y experiencia Fintech
 st.markdown("""
 <style>
     header[data-testid="stHeader"] { display: none !important; }
@@ -58,7 +60,7 @@ st.markdown("""
         display: flex;
         align-items: center;
         justify-content: space-between;
-        margin-bottom: 15px;
+        margin-bottom: 12px;
     }
     .app-title {
         font-size: 1.6rem;
@@ -67,25 +69,13 @@ st.markdown("""
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
     }
-    .user-pill {
-        background: #1e293b;
-        border: 1px solid #38bdf8;
-        padding: 6px 14px;
-        border-radius: 20px;
-        font-size: 0.85rem;
-        font-weight: 700;
-        color: #f8fafc;
-        display: flex;
-        align-items: center;
-        gap: 6px;
-    }
     
     .hero-card {
         background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
         border: 1px solid #334155;
         border-radius: 18px;
         padding: 20px;
-        margin-bottom: 20px;
+        margin-bottom: 18px;
         box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3);
     }
     .hero-label {
@@ -147,68 +137,146 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Manejo de usuarios
-lista_usuarios = db.obtener_usuarios()
-nombres_usuarios = [u["nombre"] for u in lista_usuarios]
-
-if "usuario_actual" not in st.session_state or st.session_state["usuario_actual"] not in nombres_usuarios:
-    st.session_state["usuario_actual"] = nombres_usuarios[0] if nombres_usuarios else "Principal"
+# Variables de Sesión
+if "user" not in st.session_state:
+    st.session_state["user"] = None
 
 if "vista" not in st.session_state:
     st.session_state["vista"] = "menu"
 
-if "modo_vista" not in st.session_state:
-    st.session_state["modo_vista"] = "personal"  # 'personal' o 'familiar'
+if "espacio" not in st.session_state:
+    st.session_state["espacio"] = "personal"  # 'personal' o 'familiar'
 
 def ir_a(vista_nombre):
     st.session_state["vista"] = vista_nombre
     st.rerun()
 
+def cerrar_sesion():
+    st.session_state["user"] = None
+    st.session_state["vista"] = "menu"
+    st.rerun()
+
 # ==============================================================================
-# VISTA 1: MENÚ PRINCIPAL
+# PANTALLA: LOGIN / REGISTRO (SI NO HAY SESIÓN INICIADA)
+# ==============================================================================
+if not st.session_state["user"]:
+    st.markdown("""
+    <div style="text-align: center; margin-top: 1.5rem; margin-bottom: 1.5rem;">
+        <div style="font-size: 3rem;">💳</div>
+        <div class="app-title" style="font-size: 2rem;">Finanzas Ezy</div>
+        <div style="color: #94a3b8; font-size: 0.9rem;">Tu control de gastos personal y familiar con IA</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    tab_login, tab_registro = st.tabs(["🔑 Iniciar Sesión", "✨ Crear mi Cuenta"])
+
+    with tab_login:
+        with st.form("form_login"):
+            st.markdown("### Bienvenido de nuevo")
+            l_email = st.text_input("Correo electrónico:", placeholder="tu@email.com").strip().lower()
+            l_pass = st.text_input("Contraseña:", type="password")
+            
+            if st.form_submit_button("Entrar a mis Finanzas", type="primary", use_container_width=True):
+                if not l_email or not l_pass:
+                    st.error("Por favor completa tu correo y contraseña.")
+                else:
+                    ok, res = db.autenticar_usuario(l_email, l_pass)
+                    if ok:
+                        st.session_state["user"] = res
+                        st.toast(f"¡Hola de nuevo, {res['nombre']}!", icon="👋")
+                        st.rerun()
+                    else:
+                        st.error(res)
+
+    with tab_registro:
+        with st.form("form_registro"):
+            st.markdown("### Crea tu cuenta personal")
+            st.caption("Cada familiar tiene su propia cuenta segura. Luego podrán unirse al grupo familiar.")
+            r_nombre = st.text_input("Tu Nombre:", placeholder="Ej: Joel, María, etc.")
+            r_email = st.text_input("Tu Correo:", placeholder="tu@email.com").strip().lower()
+            r_pass = st.text_input("Crea una contraseña:", type="password")
+            r_avatar = st.selectbox("Elige tu Avatar:", db.AVATARES_DEFAULT)
+
+            if st.form_submit_button("Crear mi Cuenta Gratis", type="primary", use_container_width=True):
+                if len(r_pass) < 4:
+                    st.error("La contraseña debe tener al menos 4 caracteres.")
+                else:
+                    ok, res = db.registrar_usuario(r_email, r_pass, r_nombre, r_avatar)
+                    if ok:
+                        st.session_state["user"] = res
+                        st.success("🎉 ¡Cuenta creada con éxito!")
+                        st.rerun()
+                    else:
+                        st.error(res)
+    st.stop()
+
+# ==============================================================================
+# SESIÓN ACTIVA: DATOS DEL USUARIO Y GRUPO
+# ==============================================================================
+usuario = st.session_state["user"]
+grupo_info = db.obtener_datos_grupo(usuario.get("grupo_id"))
+
+# ==============================================================================
+# VISTA 1: MENÚ PRINCIPAL (HOME)
 # ==============================================================================
 if st.session_state["vista"] == "menu":
-    # Header con selector de miembro de la familia
-    col_h1, col_h2 = st.columns([3, 2])
+    # Header con Perfil y Salir
+    col_h1, col_h2 = st.columns([3, 1])
     with col_h1:
-        st.markdown("""
+        st.markdown(f"""
         <div style="line-height: 1.2;">
-            <div class="app-title">💳 Finanzas</div>
-            <div style="font-size: 0.8rem; color: #64748b;">Control familiar con IA</div>
+            <div class="app-title">Finanzas Ezy</div>
+            <div style="font-size: 0.85rem; color: #94a3b8;">Hola, <b>{usuario['avatar']} {usuario['nombre']}</b></div>
         </div>
         """, unsafe_allow_html=True)
     with col_h2:
-        idx_u = nombres_usuarios.index(st.session_state["usuario_actual"]) if st.session_state["usuario_actual"] in nombres_usuarios else 0
-        u_sel = st.selectbox("Perfil:", nombres_usuarios, index=idx_u, label_visibility="collapsed")
-        if u_sel != st.session_state["usuario_actual"]:
-            st.session_state["usuario_actual"] = u_sel
-            st.rerun()
+        if st.button("🚪 Salir", use_container_width=True):
+            cerrar_sesion()
 
-    # Selector de Modo: Mis Gastos vs Total Familiar
-    modo_opcion = st.radio(
-        "Modo de visualización:",
-        [f"👤 Solo de {st.session_state['usuario_actual']}", "👨‍👩‍👧‍👦 Total Familiar (Todos)"],
-        horizontal=True,
-        label_visibility="collapsed"
-    )
-    st.session_state["modo_vista"] = "personal" if "Solo de" in modo_opcion else "familiar"
+    # Selector de Espacio: Personal vs Familiar
+    if grupo_info:
+        espacio_elegido = st.radio(
+            "Espacio:",
+            [f"👤 Mis Gastos Personales", f"👨‍👩‍👧‍👦 {grupo_info['nombre']}"],
+            horizontal=True,
+            label_visibility="collapsed"
+        )
+        st.session_state["espacio"] = "personal" if "Mis Gastos" in espacio_elegido else "familiar"
+    else:
+        st.session_state["espacio"] = "personal"
+        # Tarjeta informativa para crear o unirse a una familia
+        with st.container():
+            st.markdown(f"""
+            <div style="background: #1e293b; border: 1px dashed #38bdf8; border-radius: 14px; padding: 12px; margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between;">
+                <div style="font-size: 0.85rem; color: #cbd5e1;">
+                    👨‍👩‍👧‍👦 <b>¿Quieres compartir gastos con tu familia?</b>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            if st.button("Conectar con mi Familia (Crear o Unirme)", use_container_width=True):
+                ir_a("familia")
 
-    # Datos según el modo
+    # Métricas del mes actual
     hoy = datetime.now()
     meses_es = ["", "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", 
                 "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
     
-    filtro_user = None if st.session_state["modo_vista"] == "familiar" else st.session_state["usuario_actual"]
-    df_mes = db.obtener_gastos_df(mes=hoy.month, anio=hoy.year, usuario=filtro_user)
-    
+    df_mes = db.obtener_gastos_df(
+        user_id=usuario["id"],
+        grupo_id=usuario.get("grupo_id"),
+        modo=st.session_state["espacio"],
+        mes=hoy.month,
+        anio=hoy.year
+    )
+
     total_mes = df_mes["monto"].sum() if not df_mes.empty else 0.0
     total_tc = df_mes[df_mes["medio_pago"] == "Tarjeta de Crédito"]["monto"].sum() if not df_mes.empty else 0.0
     total_ef = df_mes[df_mes["medio_pago"] != "Tarjeta de Crédito"]["monto"].sum() if not df_mes.empty else 0.0
     cant_compras = len(df_mes) if not df_mes.empty else 0
 
-    etiqueta_hero = f"Gastos de {st.session_state['usuario_actual']} • {meses_es[hoy.month]}" if st.session_state["modo_vista"] == "personal" else f"Total del Hogar • {meses_es[hoy.month]}"
+    etiqueta_hero = f"Gastos de {usuario['nombre']} • {meses_es[hoy.month]}" if st.session_state["espacio"] == "personal" else f"Total {grupo_info['nombre']} • {meses_es[hoy.month]}"
 
-    # Hero Card
+    # Tarjeta Principal (Hero)
     st.markdown(f"""
     <div class="hero-card">
         <div class="hero-label">{etiqueta_hero}</div>
@@ -230,14 +298,14 @@ if st.session_state["vista"] == "menu":
     </div>
     """, unsafe_allow_html=True)
 
-    # Cuadrícula de Acciones (Touch Cards)
+    # Botones táctiles grandes (Touch Cards)
     st.markdown("### ¿Qué quieres hacer?")
     c1, c2 = st.columns(2)
     with c1:
         if st.button("📸 Escanear Ticket\n\n(Foto o Cámara)", use_container_width=True, type="primary"):
             ir_a("ticket")
         st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
-        if st.button("📊 Estadísticas\n\n(Gráficos & Familia)", use_container_width=True):
+        if st.button("📊 Estadísticas\n\n(Gráficos & Métricas)", use_container_width=True):
             ir_a("dashboard")
         st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
         if st.button("📑 Movimientos\n\n(Historial & Excel)", use_container_width=True):
@@ -250,20 +318,26 @@ if st.session_state["vista"] == "menu":
         if st.button("➕ Gasto Manual\n\n(Anotar sin ticket)", use_container_width=True):
             ir_a("manual")
         st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
-        if st.button("👥 Miembros Familia\n\n(Agregar o Cambiar)", use_container_width=True):
+        if st.button("👨‍👩‍👧‍👦 Grupo Familiar\n\n(Invitar / Ajustes)", use_container_width=True):
             ir_a("familia")
 
     # Feed de últimos gastos
     st.markdown("<br>", unsafe_allow_html=True)
-    titulo_feed = "🕒 Últimos movimientos familiares" if st.session_state["modo_vista"] == "familiar" else f"🕒 Últimos movimientos de {st.session_state['usuario_actual']}"
-    st.markdown(f"### {titulo_feed}")
+    feed_title = f"🕒 Últimos movimientos de {usuario['nombre']}" if st.session_state["espacio"] == "personal" else f"🕒 Últimos movimientos de {grupo_info['nombre']}"
+    st.markdown(f"### {feed_title}")
     
-    df_ultimos = db.obtener_ultimos_gastos(limit=4, usuario=filtro_user)
+    df_ultimos = db.obtener_ultimos_gastos(
+        user_id=usuario["id"],
+        grupo_id=usuario.get("grupo_id"),
+        modo=st.session_state["espacio"],
+        limit=4
+    )
+
     if df_ultimos.empty:
-        st.caption("Aún no tienes movimientos registrados.")
+        st.caption("Aún no tienes movimientos registrados en este espacio.")
     else:
         for _, fila in df_ultimos.iterrows():
-            tag_u = f"[{fila['usuario']}] " if st.session_state["modo_vista"] == "familiar" else ""
+            tag_u = f"[{fila['usuario']}] " if st.session_state["espacio"] == "familiar" else ""
             st.markdown(f"""
             <div class="tx-item">
                 <div>
@@ -275,7 +349,7 @@ if st.session_state["vista"] == "menu":
             """, unsafe_allow_html=True)
 
 # ==============================================================================
-# VISTA 2: ESCANEAR TICKET (IA)
+# VISTA 2: ESCANEAR TICKET (IA + DETECCIÓN DE DUPLICADOS)
 # ==============================================================================
 elif st.session_state["vista"] == "ticket":
     st.markdown('<div class="btn-back">', unsafe_allow_html=True)
@@ -284,25 +358,35 @@ elif st.session_state["vista"] == "ticket":
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown("## 📸 Escanear Ticket")
-    st.caption(f"Registrando gasto para: **{st.session_state['usuario_actual']}**")
+    st.caption(f"Registrando gasto desde la cuenta de: **{usuario['avatar']} {usuario['nombre']}**")
 
     metodo = st.radio("Modo de captura:", ["📷 Cámara", "📁 Subir Archivo"], horizontal=True)
-    img_ticket = st.camera_input("Capturar") if metodo == "📷 Cámara" else st.file_uploader("Seleccionar imagen:", type=["jpg", "jpeg", "png", "webp"])
+    img_ticket = st.camera_input("Capturar") if metodo == "📷 Cámara" else st.file_uploader("Seleccionar imagen del ticket:", type=["jpg", "jpeg", "png", "webp"])
 
     if img_ticket is not None:
         st.image(img_ticket, use_container_width=True)
 
         if st.button("✨ Analizar Ticket con IA", type="primary", use_container_width=True):
-            with st.spinner("Analizando ticket con IA optimizada..."):
+            with st.spinner("Analizando y leyendo ticket con IA..."):
                 try:
                     resultado = ai.extraer_ticket(img_ticket.getvalue(), img_ticket.type or "image/jpeg")
                     st.session_state["ticket_temp"] = resultado
-                    st.success("✅ ¡Datos detectados! Revisa abajo:")
+                    st.success("✅ ¡Datos detectados!")
                 except Exception as e:
                     st.error(f"Error: {e}")
 
     if "ticket_temp" in st.session_state and st.session_state["ticket_temp"]:
         d = st.session_state["ticket_temp"]
+        
+        # Alerta Inteligente de Duplicados
+        es_duplicado, dup_data = db.verificar_posible_duplicado(
+            fecha=d.get("fecha", datetime.now().strftime("%Y-%m-%d")),
+            comercio=d.get("comercio", ""),
+            monto=float(d.get("monto", 0.0))
+        )
+        if es_duplicado:
+            st.warning(f"⚠️ **Atención:** Parece que este gasto ya fue registrado antes (${dup_data['monto']:,.2f} en {dup_data['comercio']} el {dup_data['fecha']} por {dup_data['usuario']}). Si es una compra distinta, puedes continuar.")
+
         with st.form("form_ticket_mobile"):
             st.markdown("### Datos extraídos:")
             
@@ -323,9 +407,10 @@ elif st.session_state["vista"] == "ticket":
             mp_idx = db.MEDIOS_PAGO_DEFAULT.index(mp_sug) if mp_sug in db.MEDIOS_PAGO_DEFAULT else 0
             n_mp = st.selectbox("Medio de Pago:", db.MEDIOS_PAGO_DEFAULT, index=mp_idx)
             
-            # Selector de miembro asignado (por defecto el activo)
-            idx_u_ticket = nombres_usuarios.index(st.session_state["usuario_actual"]) if st.session_state["usuario_actual"] in nombres_usuarios else 0
-            n_usuario = st.selectbox("Gasto realizado por:", nombres_usuarios, index=idx_u_ticket)
+            # Selector de Visibilidad (Privado vs Familiar)
+            opciones_vis = ["👨‍👩‍👧‍👦 Compartir con la Familia", "🔒 Gasto Privado (Solo para mí)"]
+            sel_vis = st.selectbox("Visibilidad del Gasto:", opciones_vis, index=0 if grupo_info else 1)
+            vis_val = "familiar" if "Compartir" in sel_vis else "personal"
 
             n_cuotas = st.text_input("Cuotas:", value=str(d.get("cuotas", "1")))
             n_notas = st.text_input("Notas / Detalle:", value=d.get("notas", ""))
@@ -341,7 +426,10 @@ elif st.session_state["vista"] == "ticket":
                     cuotas=n_cuotas,
                     origen="Ticket",
                     notas=n_notas,
-                    usuario=n_usuario
+                    usuario=usuario["nombre"],
+                    user_id=usuario["id"],
+                    grupo_id=usuario.get("grupo_id"),
+                    visibilidad=vis_val
                 )
                 st.session_state["ticket_temp"] = None
                 st.toast("🎉 ¡Gasto guardado con éxito!", icon="✅")
@@ -357,15 +445,13 @@ elif st.session_state["vista"] == "tarjeta":
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown("## 💳 Resumen de Tarjeta (Lote)")
-    
-    idx_u_tc = nombres_usuarios.index(st.session_state["usuario_actual"]) if st.session_state["usuario_actual"] in nombres_usuarios else 0
-    usuario_tarjeta = st.selectbox("Tarjeta perteneciente a:", nombres_usuarios, index=idx_u_tc)
-    
-    archivo_tc = st.file_uploader("Subir PDF o foto del resumen bancario:", type=["pdf", "jpg", "jpeg", "png"])
+    st.caption("Sube tu resumen bancario (PDF o foto). La IA extraerá todos los consumos:")
+
+    archivo_tc = st.file_uploader("Subir PDF o imagen del extracto:", type=["pdf", "jpg", "jpeg", "png"])
 
     if archivo_tc is not None:
-        if st.button("✨ Procesar Resumen Completo", type="primary", use_container_width=True):
-            with st.spinner("Extrayendo consumos y cuotas con IA..."):
+        if st.button("✨ Procesar Resumen Completo con IA", type="primary", use_container_width=True):
+            with st.spinner("Extrayendo consumos en lote con IA..."):
                 try:
                     mime = archivo_tc.type or ("application/pdf" if archivo_tc.name.endswith(".pdf") else "image/jpeg")
                     consumos = ai.extraer_resumen_tarjeta(archivo_tc.getvalue(), mime)
@@ -379,7 +465,7 @@ elif st.session_state["vista"] == "tarjeta":
 
     if "consumos_lote" in st.session_state and st.session_state["consumos_lote"]:
         df_tc = pd.DataFrame(st.session_state["consumos_lote"])
-        df_tc["usuario"] = usuario_tarjeta
+        df_tc["usuario"] = usuario["nombre"]
         st.markdown(f"**Total detectado:** ${df_tc['monto'].sum():,.2f}")
         
         df_edit = st.data_editor(
@@ -388,14 +474,23 @@ elif st.session_state["vista"] == "tarjeta":
             num_rows="dynamic"
         )
         
+        vis_tc = st.radio("¿Cómo guardar estos consumos?", ["👨‍👩‍👧‍👦 Compartir con la Familia", "🔒 Guardar como Personales"], horizontal=True)
+        vis_final = "familiar" if "Compartir" in vis_tc else "personal"
+
         if st.button("💾 Guardar TODOS los consumos", type="primary", use_container_width=True):
-            total_guardados = db.insertar_gastos_lote(df_edit.to_dict(orient="records"), usuario_default=usuario_tarjeta)
+            total_guardados = db.insertar_gastos_lote(
+                lista_gastos=df_edit.to_dict(orient="records"),
+                usuario_default=usuario["nombre"],
+                user_id=usuario["id"],
+                grupo_id=usuario.get("grupo_id"),
+                visibilidad_default=vis_final
+            )
             st.session_state["consumos_lote"] = None
-            st.toast(f"¡{total_guardados} consumos asignados a {usuario_tarjeta}!", icon="✅")
+            st.toast(f"¡{total_guardados} consumos registrados!", icon="✅")
             ir_a("menu")
 
 # ==============================================================================
-# VISTA 4: ESTADÍSTICAS & COMPARATIVA FAMILIAR
+# VISTA 4: ESTADÍSTICAS & DASHBOARD
 # ==============================================================================
 elif st.session_state["vista"] == "dashboard":
     st.markdown('<div class="btn-back">', unsafe_allow_html=True)
@@ -403,7 +498,7 @@ elif st.session_state["vista"] == "dashboard":
         ir_a("menu")
     st.markdown('</div>', unsafe_allow_html=True)
 
-    st.markdown("## 📊 Estadísticas")
+    st.markdown("## 📊 Estadísticas y Análisis")
     
     col_f1, col_f2 = st.columns(2)
     with col_f1:
@@ -414,30 +509,30 @@ elif st.session_state["vista"] == "dashboard":
         sel_mes = st.selectbox("Mes:", meses_n, index=datetime.now().month)
         num_m = None if sel_mes == "Todos" else meses_n.index(sel_mes)
 
-    # Filtro de usuario en estadísticas
-    opciones_filtro_u = ["👨‍👩‍👧‍👦 Toda la Familia"] + nombres_usuarios
-    idx_def_u = opciones_filtro_u.index(st.session_state["usuario_actual"]) if st.session_state["modo_vista"] == "personal" else 0
-    sel_u_stats = st.selectbox("Ver datos de:", opciones_filtro_u, index=idx_def_u)
-    
-    filtro_db = None if "Toda la Familia" in sel_u_stats else sel_u_stats
-    df_d = db.obtener_gastos_df(mes=num_m, anio=sel_anio, usuario=filtro_db)
+    df_d = db.obtener_gastos_df(
+        user_id=usuario["id"],
+        grupo_id=usuario.get("grupo_id"),
+        modo=st.session_state["espacio"],
+        mes=num_m,
+        anio=sel_anio
+    )
 
     if df_d.empty:
-        st.info("No hay gastos registrados para este período.")
+        st.info("No hay gastos registrados en este período y espacio.")
     else:
         st.metric("Total Gastado:", f"${df_d['monto'].sum():,.2f}")
 
-        # Si es vista familiar, mostrar comparación entre miembros
-        if "Toda la Familia" in sel_u_stats and "usuario" in df_d.columns:
-            st.subheader("👥 Gastos por Miembro de la Familia")
-            df_usuarios_monto = df_d.groupby("usuario")["monto"].sum().reset_index().sort_values(by="monto", ascending=False)
+        # Comparativa por Miembro si es espacio familiar
+        if st.session_state["espacio"] == "familiar" and "usuario" in df_d.columns:
+            st.subheader("👥 Aportes por Integrante del Hogar")
+            df_u_monto = df_d.groupby("usuario")["monto"].sum().reset_index().sort_values(by="monto", ascending=False)
             fig_fam = px.bar(
-                df_usuarios_monto,
+                df_u_monto,
                 x="usuario",
                 y="monto",
                 color="usuario",
                 text_auto=".2s",
-                labels={"usuario": "Miembro", "monto": "Monto ($)"}
+                labels={"usuario": "Familiar", "monto": "Total Gastado ($)"}
             )
             fig_fam.update_layout(margin=dict(t=5, b=5, l=5, r=5), showlegend=False)
             st.plotly_chart(fig_fam, use_container_width=True)
@@ -473,9 +568,10 @@ elif st.session_state["vista"] == "manual":
         f_cat = st.selectbox("Categoría:", db.CATEGORIAS_DEFAULT)
         f_mp = st.selectbox("Medio de Pago:", db.MEDIOS_PAGO_DEFAULT)
         
-        idx_u_manual = nombres_usuarios.index(st.session_state["usuario_actual"]) if st.session_state["usuario_actual"] in nombres_usuarios else 0
-        f_user = st.selectbox("Miembro asignado:", nombres_usuarios, index=idx_u_manual)
-        
+        opciones_vis_m = ["👨‍👩‍👧‍👦 Compartir con la Familia", "🔒 Gasto Privado (Solo para mí)"]
+        sel_vis_m = st.selectbox("Visibilidad:", opciones_vis_m, index=0 if grupo_info else 1)
+        vis_val_m = "familiar" if "Compartir" in sel_vis_m else "personal"
+
         f_cuotas = st.text_input("Cuotas:", value="1")
         f_notas = st.text_input("Notas adicionales:")
 
@@ -493,13 +589,16 @@ elif st.session_state["vista"] == "manual":
                     cuotas=f_cuotas,
                     origen="Manual",
                     notas=f_notas,
-                    usuario=f_user
+                    usuario=usuario["nombre"],
+                    user_id=usuario["id"],
+                    grupo_id=usuario.get("grupo_id"),
+                    visibilidad=vis_val_m
                 )
                 st.toast("¡Gasto guardado con éxito!", icon="✅")
                 ir_a("menu")
 
 # ==============================================================================
-# VISTA 6: GESTIÓN DE MIEMBROS DE LA FAMILIA
+# VISTA 6: GESTIÓN DE GRUPOS FAMILIARES (INVITAR Y UNIRSE)
 # ==============================================================================
 elif st.session_state["vista"] == "familia":
     st.markdown('<div class="btn-back">', unsafe_allow_html=True)
@@ -507,39 +606,78 @@ elif st.session_state["vista"] == "familia":
         ir_a("menu")
     st.markdown('</div>', unsafe_allow_html=True)
 
-    st.markdown("## 👥 Miembros de la Familia")
-    st.caption("Administra los perfiles de tu hogar:")
+    st.markdown("## 👨‍👩‍👧‍👦 Grupo Familiar")
 
-    # Lista de perfiles actuales
-    for u in lista_usuarios:
-        es_activo = (u["nombre"] == st.session_state["usuario_actual"])
-        col_u1, col_u2 = st.columns([4, 2])
-        with col_u1:
-            st.markdown(f"### {u['avatar']} {u['nombre']} {'*(Activo)*' if es_activo else ''}")
-        with col_u2:
-            if not es_activo:
-                if st.button(f"Seleccionar", key=f"sel_{u['nombre']}", use_container_width=True):
-                    st.session_state["usuario_actual"] = u["nombre"]
-                    st.rerun()
+    if grupo_info:
+        st.success(f"Estás en el grupo: **{grupo_info['nombre']}**")
+        
+        # Tarjeta del código de invitación
+        st.markdown(f"""
+        <div style="background: #1e293b; border: 2px dashed #38bdf8; border-radius: 14px; padding: 18px; text-align: center; margin: 15px 0;">
+            <div style="font-size: 0.85rem; color: #94a3b8; text-transform: uppercase;">Código para invitar a tus familiares:</div>
+            <div style="font-size: 2rem; font-weight: 800; color: #38bdf8; letter-spacing: 2px; margin: 8px 0;">{grupo_info['codigo']}</div>
+            <div style="font-size: 0.8rem; color: #cbd5e1;">Pásales este código para que se unan desde sus teléfonos.</div>
+        </div>
+        """, unsafe_allow_html=True)
 
-    st.markdown("---")
-    st.markdown("### ➕ Agregar Nuevo Integrante")
-    with st.form("form_nuevo_miembro"):
-        nuevo_nom = st.text_input("Nombre del familiar:")
-        nuevo_av = st.selectbox("Avatar:", db.AVATARES_DEFAULT)
-        if st.form_submit_button("Crear Perfil", type="primary", use_container_width=True):
-            if nuevo_nom.strip():
-                if db.crear_usuario(nuevo_nom, nuevo_av):
-                    st.session_state["usuario_actual"] = nuevo_nom.strip().capitalize()
-                    st.toast(f"¡Perfil de {nuevo_nom} creado!", icon="🎉")
-                    st.rerun()
-                else:
-                    st.error("Ese nombre ya existe o es inválido.")
-            else:
-                st.error("Ingresa un nombre.")
+        st.markdown("### Integrantes unidos:")
+        for m in grupo_info["miembros"]:
+            es_yo = (m["id"] == usuario["id"])
+            st.markdown(f"""
+            <div class="tx-item">
+                <div style="display: flex; align-items: center; gap: 8px;">
+                    <span style="font-size: 1.4rem;">{m['avatar']}</span>
+                    <div>
+                        <div class="tx-title">{m['nombre']} {'(Tú)' if es_yo else ''}</div>
+                        <div class="tx-cat">{m['email']}</div>
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🚪 Salir de este Grupo Familiar", type="secondary"):
+            db.salir_de_grupo_familiar(usuario["id"])
+            usuario["grupo_id"] = None
+            st.session_state["user"]["grupo_id"] = None
+            st.toast("Has salido del grupo.", icon="ℹ️")
+            st.rerun()
+
+    else:
+        st.caption("Aún no estás conectado a ningún grupo familiar. Puedes crear uno nuevo o unirte a uno existente:")
+
+        tab_crear_g, tab_unir_g = st.tabs(["➕ Crear Grupo Familiar", "🔗 Unirme con un Código"])
+
+        with tab_crear_g:
+            with st.form("form_crear_grupo"):
+                st.markdown("### Crear un nuevo Hogar")
+                nom_g = st.text_input("Nombre de la familia o grupo:", placeholder="Ej: Familia Benavidez")
+                if st.form_submit_button("Crear Grupo y Obtener Código", type="primary", use_container_width=True):
+                    if nom_g.strip():
+                        ok, g_nuevo = db.crear_grupo_familiar(usuario["id"], nom_g)
+                        if ok:
+                            st.session_state["user"]["grupo_id"] = g_nuevo["id"]
+                            st.success(f"🎉 ¡Grupo creado! Código de invitación: {g_nuevo['codigo']}")
+                            st.rerun()
+                        else:
+                            st.error(g_nuevo)
+
+        with tab_unir_g:
+            with st.form("form_unir_grupo"):
+                st.markdown("### Unirme con Invitación")
+                cod_ingresado = st.text_input("Pega el código de invitación recibido:", placeholder="Ej: BEN-4829").strip().upper()
+                if st.form_submit_button("Unirme al Grupo Familiar", type="primary", use_container_width=True):
+                    if cod_ingresado:
+                        ok, res = db.unirse_a_grupo_familiar(usuario["id"], cod_ingresado)
+                        if ok:
+                            st.session_state["user"]["grupo_id"] = res["id"]
+                            st.success(f"🎉 ¡Te has unido con éxito a {res['nombre']}!")
+                            st.rerun()
+                        else:
+                            st.error(res)
 
 # ==============================================================================
-# VISTA 7: HISTORIAL & EXCEL
+# VISTA 7: HISTORIAL & DESCARGA EN EXCEL
 # ==============================================================================
 elif st.session_state["vista"] == "historial":
     st.markdown('<div class="btn-back">', unsafe_allow_html=True)
@@ -549,39 +687,41 @@ elif st.session_state["vista"] == "historial":
 
     st.markdown("## 📑 Movimientos & Excel")
     
-    # Botón directo para descargar Excel
-    db.sincronizar_con_excel()
-    if os.path.exists(db.EXCEL_FILE):
-        with open(db.EXCEL_FILE, "rb") as f:
-            st.download_button(
-                label="📥 Descargar archivo Excel (.xlsx) [Con hojas separadas por miembro]",
-                data=f,
-                file_name=f"gastos_familia_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                type="primary"
-            )
+    df_todos = db.obtener_gastos_df(
+        user_id=usuario["id"],
+        grupo_id=usuario.get("grupo_id"),
+        modo=st.session_state["espacio"]
+    )
 
-    st.markdown("<br>", unsafe_allow_html=True)
-    
-    # Filtro por usuario en la tabla
-    filtro_u_hist = st.selectbox("Filtrar registros por:", ["👨‍👩‍👧‍👦 Toda la Familia"] + nombres_usuarios)
-    u_query = None if "Toda la Familia" in filtro_u_hist else filtro_u_hist
-    
-    df_todos = db.obtener_gastos_df(usuario=u_query)
-    
-    if df_todos.empty:
-        st.info("No hay registros en la base de datos.")
-    else:
+    if not df_todos.empty:
+        # Generar Excel en memoria para descarga instantánea
+        buffer_excel = io.BytesIO()
+        with pd.ExcelWriter(buffer_excel, engine="openpyxl") as writer:
+            nombre_hoja = "Mis Gastos" if st.session_state["espacio"] == "personal" else str(grupo_info['nombre'])[:30]
+            df_todos.to_excel(writer, index=False, sheet_name=nombre_hoja)
+        buffer_excel.seek(0)
+
+        st.download_button(
+            label="📥 Descargar archivo Excel (.xlsx)",
+            data=buffer_excel,
+            file_name=f"finanzas_ezy_{st.session_state['espacio']}_{datetime.now().strftime('%Y%m%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            type="primary"
+        )
+        st.markdown("<br>", unsafe_allow_html=True)
+
         st.dataframe(
-            df_todos[["id", "fecha", "comercio", "monto", "usuario", "categoria", "medio_pago", "cuotas"]],
+            df_todos[["id", "fecha", "comercio", "monto", "usuario", "categoria", "medio_pago", "visibilidad"]],
             use_container_width=True,
             hide_index=True
         )
 
         with st.expander("🗑️ Eliminar un registro"):
-            id_borrar = st.selectbox("Seleccionar ID:", df_todos["id"].tolist())
+            id_borrar = st.selectbox("Seleccionar ID del gasto a eliminar:", df_todos["id"].tolist())
             if st.button("Confirmar eliminación"):
-                db.eliminar_gasto(id_borrar)
+                db.eliminar_gasto(id_borrar, user_id=usuario["id"])
                 st.toast(f"Registro #{id_borrar} eliminado.", icon="🗑️")
                 st.rerun()
+    else:
+        st.info("No hay registros en este espacio.")

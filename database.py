@@ -1,11 +1,17 @@
 """
-Módulo de Base de Datos para Finanzas Personales Familiares
-Soporta PostgreSQL en la nube (Supabase) y SQLite local con conmutación automática.
-Maneja persistencia, perfiles de usuarios y sincronización/exportación a Microsoft Excel.
+Módulo de Base de Datos para Finanzas Personales y Familiares (Finanzas Ezy)
+- Autenticación individual por usuario (Email, Contraseña con hash SHA-256 + Salt).
+- Sistema de Grupos Familiares (Crear grupo con código de invitación único y unirse).
+- Visibilidad por gasto: 'Personal' (solo el dueño lo ve) o 'Familiar' (compartido con el grupo).
+- Detección de duplicados.
+- Presupuestos mensuales por categoría.
+- Sincronización y exportación a Microsoft Excel.
 """
 
 import os
 import sqlite3
+import hashlib
+import secrets
 import pandas as pd
 from datetime import datetime
 from dotenv import load_dotenv
@@ -54,21 +60,49 @@ def get_connection():
         conn.row_factory = sqlite3.Row
         return conn
 
+def hash_password(password, salt=None):
+    """Genera hash seguro para contraseñas usando SHA-256 con salt."""
+    if not salt:
+        salt = secrets.token_hex(16)
+    hash_obj = hashlib.sha256((password + salt).encode("utf-8"))
+    return f"{salt}${hash_obj.hexdigest()}"
+
+def verificar_password(password_plana, hash_almacenado):
+    if not hash_almacenado or "$" not in hash_almacenado:
+        return False
+    salt, hash_real = hash_almacenado.split("$", 1)
+    return hash_password(password_plana, salt) == hash_almacenado
+
 def init_db():
     conn = get_connection()
     cursor = conn.cursor()
     
     if es_postgres():
-        # Esquema PostgreSQL (Supabase)
+        # Tabla de Grupos Familiares
         cursor.execute("""
-        CREATE TABLE IF NOT EXISTS usuarios (
+        CREATE TABLE IF NOT EXISTS grupos_familiares (
             id SERIAL PRIMARY KEY,
-            nombre VARCHAR(100) UNIQUE NOT NULL,
-            avatar VARCHAR(10) DEFAULT '👤',
+            nombre VARCHAR(100) NOT NULL,
+            codigo_invitacion VARCHAR(20) UNIQUE NOT NULL,
+            creador_id INTEGER,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """)
         
+        # Tabla de Usuarios con login propio
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS cuentas_usuarios (
+            id SERIAL PRIMARY KEY,
+            email VARCHAR(255) UNIQUE NOT NULL,
+            password_hash VARCHAR(255) NOT NULL,
+            nombre VARCHAR(100) NOT NULL,
+            avatar VARCHAR(10) DEFAULT '👤',
+            grupo_id INTEGER REFERENCES grupos_familiares(id) ON DELETE SET NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+
+        # Tabla de Gastos con enlace a usuario y visibilidad
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS gastos (
             id SERIAL PRIMARY KEY,
@@ -82,29 +116,67 @@ def init_db():
             origen VARCHAR(100) DEFAULT 'Manual',
             notas TEXT,
             usuario VARCHAR(100) DEFAULT 'Principal',
+            user_id INTEGER REFERENCES cuentas_usuarios(id) ON DELETE CASCADE,
+            grupo_id INTEGER REFERENCES grupos_familiares(id) ON DELETE SET NULL,
+            visibilidad VARCHAR(20) DEFAULT 'familiar',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """)
-        
-        cursor.execute("SELECT COUNT(*) FROM usuarios;")
-        res = cursor.fetchone()
-        count = res["count"] if isinstance(res, dict) else res[0]
-        if count == 0:
-            cursor.execute("INSERT INTO usuarios (nombre, avatar) VALUES (%s, %s);", ("Principal", "👤"))
-    else:
-        # Esquema SQLite local
+
+        # Migración segura de columnas en gastos si la tabla ya existía
         cursor.execute("""
-        CREATE TABLE IF NOT EXISTS usuarios (
+        DO $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='gastos' AND column_name='user_id') THEN
+                ALTER TABLE gastos ADD COLUMN user_id INTEGER;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='gastos' AND column_name='grupo_id') THEN
+                ALTER TABLE gastos ADD COLUMN grupo_id INTEGER;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='gastos' AND column_name='visibilidad') THEN
+                ALTER TABLE gastos ADD COLUMN visibilidad VARCHAR(20) DEFAULT 'familiar';
+            END IF;
+        END $$;
+        """)
+
+        # Tabla de Presupuestos mensuales
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS presupuestos (
+            id SERIAL PRIMARY KEY,
+            grupo_id INTEGER,
+            user_id INTEGER,
+            categoria VARCHAR(100) NOT NULL,
+            monto_maximo NUMERIC(12, 2) NOT NULL,
+            mes INTEGER NOT NULL,
+            anio INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+
+    else:
+        # Modo SQLite Local
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS grupos_familiares (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nombre TEXT UNIQUE NOT NULL,
-            avatar TEXT DEFAULT '👤',
+            nombre TEXT NOT NULL,
+            codigo_invitacion TEXT UNIQUE NOT NULL,
+            creador_id INTEGER,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         """)
-        cursor.execute("SELECT COUNT(*) FROM usuarios;")
-        if cursor.fetchone()[0] == 0:
-            cursor.execute("INSERT INTO usuarios (nombre, avatar) VALUES (?, ?);", ("Principal", "👤"))
-            
+        
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS cuentas_usuarios (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            nombre TEXT NOT NULL,
+            avatar TEXT DEFAULT '👤',
+            grupo_id INTEGER,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS gastos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -118,89 +190,237 @@ def init_db():
             origen TEXT DEFAULT 'Manual',
             notas TEXT,
             usuario TEXT DEFAULT 'Principal',
+            user_id INTEGER,
+            grupo_id INTEGER,
+            visibilidad TEXT DEFAULT 'familiar',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         """)
-        
-        cursor.execute("PRAGMA table_info(gastos);")
-        columnas = [col[1] for col in cursor.fetchall()]
-        if "usuario" not in columnas:
-            cursor.execute("ALTER TABLE gastos ADD COLUMN usuario TEXT DEFAULT 'Principal';")
 
     conn.commit()
     conn.close()
 
-# --- FUNCIONES DE USUARIOS ---
-def obtener_usuarios():
-    """Devuelve la lista de miembros de la familia como diccionarios."""
+# --- AUTENTICACIÓN Y CUENTAS ---
+def registrar_usuario(email, password, nombre, avatar="👤"):
+    """Registra una nueva cuenta de usuario individual."""
+    email_limpio = email.strip().lower()
+    nombre_limpio = nombre.strip().capitalize()
+    if not email_limpio or not password or not nombre_limpio:
+        return False, "Completa todos los campos obligatorios."
+    
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, nombre, avatar FROM usuarios ORDER BY id ASC;")
-    filas = cursor.fetchall()
-    conn.close()
-    return [{"id": r["id"], "nombre": r["nombre"], "avatar": r["avatar"]} for r in filas]
+    p_hash = hash_password(password)
 
-def crear_usuario(nombre, avatar="👤"):
-    """Crea un nuevo perfil de usuario."""
-    nombre_limpio = nombre.strip().capitalize()
-    if not nombre_limpio:
-        return False
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
         if es_postgres():
-            cursor.execute("INSERT INTO usuarios (nombre, avatar) VALUES (%s, %s);", (nombre_limpio, avatar))
+            cursor.execute("""
+            INSERT INTO cuentas_usuarios (email, password_hash, nombre, avatar)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id;
+            """, (email_limpio, p_hash, nombre_limpio, avatar))
+            res = cursor.fetchone()
+            u_id = res["id"] if isinstance(res, dict) else res[0]
         else:
-            cursor.execute("INSERT INTO usuarios (nombre, avatar) VALUES (?, ?);", (nombre_limpio, avatar))
+            cursor.execute("""
+            INSERT INTO cuentas_usuarios (email, password_hash, nombre, avatar)
+            VALUES (?, ?, ?, ?);
+            """, (email_limpio, p_hash, nombre_limpio, avatar))
+            u_id = cursor.lastrowid
         conn.commit()
         conn.close()
-        return True
-    except Exception:
-        return False
+        return True, {"id": u_id, "email": email_limpio, "nombre": nombre_limpio, "avatar": avatar, "grupo_id": None}
+    except Exception as e:
+        conn.close()
+        if "unique" in str(e).lower():
+            return False, "Ya existe una cuenta registrada con este correo electrónico."
+        return False, f"Error al registrar: {e}"
 
-def eliminar_usuario(nombre):
-    """Elimina un perfil (sin borrar sus gastos, se reasignan a 'Principal')."""
-    if nombre == "Principal":
-        return False
+def autenticar_usuario(email, password):
+    """Inicia sesión verificando credenciales."""
+    email_limpio = email.strip().lower()
     conn = get_connection()
     cursor = conn.cursor()
-    if es_postgres():
-        cursor.execute("UPDATE gastos SET usuario = 'Principal' WHERE usuario = %s;", (nombre,))
-        cursor.execute("DELETE FROM usuarios WHERE nombre = %s;", (nombre,))
+    placeholder = "%s" if es_postgres() else "?"
+
+    cursor.execute(f"SELECT * FROM cuentas_usuarios WHERE email = {placeholder};", (email_limpio,))
+    u = cursor.fetchone()
+    conn.close()
+
+    if not u:
+        return False, "Correo o contraseña incorrectos."
+
+    p_hash = u["password_hash"] if isinstance(u, dict) else u[2]
+    if verificar_password(password, p_hash):
+        u_dict = {
+            "id": u["id"] if isinstance(u, dict) else u[0],
+            "email": u["email"] if isinstance(u, dict) else u[1],
+            "nombre": u["nombre"] if isinstance(u, dict) else u[3],
+            "avatar": u["avatar"] if isinstance(u, dict) else u[4],
+            "grupo_id": u["grupo_id"] if isinstance(u, dict) else u[5]
+        }
+        return True, u_dict
     else:
-        cursor.execute("UPDATE gastos SET usuario = 'Principal' WHERE usuario = ?;", (nombre,))
-        cursor.execute("DELETE FROM usuarios WHERE nombre = ?;", (nombre,))
+        return False, "Correo o contraseña incorrectos."
+
+# --- SISTEMA DE GRUPOS FAMILIARES ---
+def crear_grupo_familiar(user_id, nombre_grupo):
+    """Crea un nuevo grupo familiar y genera un código de invitación único."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    # Generar código tipo BEN-4829
+    prefijo = "".join(c for c in nombre_grupo[:3].upper() if c.isalnum()) or "FAM"
+    codigo = f"{prefijo}-{secrets.randbelow(8999) + 1000}"
+
+    try:
+        if es_postgres():
+            cursor.execute("""
+            INSERT INTO grupos_familiares (nombre, codigo_invitacion, creador_id)
+            VALUES (%s, %s, %s)
+            RETURNING id;
+            """, (nombre_grupo.strip(), codigo, user_id))
+            res = cursor.fetchone()
+            g_id = res["id"] if isinstance(res, dict) else res[0]
+            cursor.execute("UPDATE cuentas_usuarios SET grupo_id = %s WHERE id = %s;", (g_id, user_id))
+        else:
+            cursor.execute("""
+            INSERT INTO grupos_familiares (nombre, codigo_invitacion, creador_id)
+            VALUES (?, ?, ?);
+            """, (nombre_grupo.strip(), codigo, user_id))
+            g_id = cursor.lastrowid
+            cursor.execute("UPDATE cuentas_usuarios SET grupo_id = ? WHERE id = ?;", (g_id, user_id))
+
+        conn.commit()
+        conn.close()
+        return True, {"id": g_id, "nombre": nombre_grupo, "codigo": codigo}
+    except Exception as e:
+        conn.close()
+        return False, str(e)
+
+def unirse_a_grupo_familiar(user_id, codigo_invitacion):
+    """Permite a un usuario unirse a una familia existente con su código."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    codigo_limpio = codigo_invitacion.strip().upper()
+    placeholder = "%s" if es_postgres() else "?"
+
+    cursor.execute(f"SELECT id, nombre FROM grupos_familiares WHERE codigo_invitacion = {placeholder};", (codigo_limpio,))
+    grupo = cursor.fetchone()
+
+    if not grupo:
+        conn.close()
+        return False, "Código de invitación no encontrado o incorrecto."
+
+    g_id = grupo["id"] if isinstance(grupo, dict) else grupo[0]
+    g_nombre = grupo["nombre"] if isinstance(grupo, dict) else grupo[1]
+
+    cursor.execute(f"UPDATE cuentas_usuarios SET grupo_id = {placeholder} WHERE id = {placeholder};", (g_id, user_id))
     conn.commit()
     conn.close()
-    sincronizar_con_excel()
+    return True, {"id": g_id, "nombre": g_nombre, "codigo": codigo_limpio}
+
+def obtener_datos_grupo(grupo_id):
+    """Obtiene información del grupo y la lista de miembros unidos."""
+    if not grupo_id:
+        return None
+    conn = get_connection()
+    cursor = conn.cursor()
+    placeholder = "%s" if es_postgres() else "?"
+
+    cursor.execute(f"SELECT * FROM grupos_familiares WHERE id = {placeholder};", (grupo_id,))
+    g = cursor.fetchone()
+    if not g:
+        conn.close()
+        return None
+
+    cursor.execute(f"SELECT id, nombre, email, avatar FROM cuentas_usuarios WHERE grupo_id = {placeholder};", (grupo_id,))
+    miembros = cursor.fetchall()
+    conn.close()
+
+    m_list = []
+    for m in miembros:
+        m_list.append({
+            "id": m["id"] if isinstance(m, dict) else m[0],
+            "nombre": m["nombre"] if isinstance(m, dict) else m[1],
+            "email": m["email"] if isinstance(m, dict) else m[2],
+            "avatar": m["avatar"] if isinstance(m, dict) else m[3]
+        })
+
+    return {
+        "id": g["id"] if isinstance(g, dict) else g[0],
+        "nombre": g["nombre"] if isinstance(g, dict) else g[1],
+        "codigo": g["codigo_invitacion"] if isinstance(g, dict) else g[2],
+        "miembros": m_list
+    }
+
+def salir_de_grupo_familiar(user_id):
+    """Permite a un usuario desvincularse de un grupo familiar."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    placeholder = "%s" if es_postgres() else "?"
+    cursor.execute(f"UPDATE cuentas_usuarios SET grupo_id = NULL WHERE id = {placeholder};", (user_id,))
+    conn.commit()
+    conn.close()
     return True
 
-# --- FUNCIONES DE GASTOS ---
-def insertar_gasto(fecha, comercio, monto, moneda="ARS", categoria="Otros", medio_pago="Efectivo", cuotas="1", origen="Manual", notas="", usuario="Principal"):
+# --- FUNCIONES DE GASTOS Y DETECCIÓN DE DUPLICADOS ---
+def verificar_posible_duplicado(fecha, comercio, monto, dias_margen=2):
+    """
+    Detecta si ya existe un gasto con mismo monto y comercio en fechas muy cercanas.
+    Retorna True y los datos del gasto duplicado si lo encuentra.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    placeholder = "%s" if es_postgres() else "?"
+    query = f"SELECT id, fecha, comercio, monto, usuario FROM gastos WHERE comercio ILIKE {placeholder} AND ABS(monto - {placeholder}) < 1.0;" if es_postgres() else f"SELECT id, fecha, comercio, monto, usuario FROM gastos WHERE LOWER(comercio) = LOWER({placeholder}) AND ABS(monto - {placeholder}) < 1.0;"
+    
+    cursor.execute(query, (comercio.strip(), float(monto)))
+    coincidencias = cursor.fetchall()
+    conn.close()
+
+    if not coincidencias:
+        return False, None
+
+    for c in coincidencias:
+        c_fecha = c["fecha"] if isinstance(c, dict) else c[1]
+        try:
+            d1 = datetime.strptime(fecha, "%Y-%m-%d")
+            d2 = datetime.strptime(c_fecha, "%Y-%m-%d")
+            if abs((d1 - d2).days) <= dias_margen:
+                return True, {
+                    "id": c["id"] if isinstance(c, dict) else c[0],
+                    "fecha": c_fecha,
+                    "comercio": c["comercio"] if isinstance(c, dict) else c[2],
+                    "monto": c["monto"] if isinstance(c, dict) else c[3],
+                    "usuario": c["usuario"] if isinstance(c, dict) else c[4]
+                }
+        except Exception:
+            continue
+    return False, None
+
+def insertar_gasto(fecha, comercio, monto, moneda="ARS", categoria="Otros", medio_pago="Efectivo", cuotas="1", origen="Manual", notas="", usuario="Principal", user_id=None, grupo_id=None, visibilidad="familiar"):
     conn = get_connection()
     cursor = conn.cursor()
     if es_postgres():
         cursor.execute("""
-        INSERT INTO gastos (fecha, comercio, monto, moneda, categoria, medio_pago, cuotas, origen, notas, usuario)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO gastos (fecha, comercio, monto, moneda, categoria, medio_pago, cuotas, origen, notas, usuario, user_id, grupo_id, visibilidad)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id;
-        """, (fecha, comercio, float(monto), moneda, categoria, medio_pago, str(cuotas), origen, notas, usuario))
+        """, (fecha, comercio, float(monto), moneda, categoria, medio_pago, str(cuotas), origen, notas, usuario, user_id, grupo_id, visibilidad))
         res = cursor.fetchone()
         gasto_id = res["id"] if isinstance(res, dict) else res[0]
     else:
         cursor.execute("""
-        INSERT INTO gastos (fecha, comercio, monto, moneda, categoria, medio_pago, cuotas, origen, notas, usuario)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (fecha, comercio, float(monto), moneda, categoria, medio_pago, str(cuotas), origen, notas, usuario))
+        INSERT INTO gastos (fecha, comercio, monto, moneda, categoria, medio_pago, cuotas, origen, notas, usuario, user_id, grupo_id, visibilidad)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (fecha, comercio, float(monto), moneda, categoria, medio_pago, str(cuotas), origen, notas, usuario, user_id, grupo_id, visibilidad))
         gasto_id = cursor.lastrowid
 
     conn.commit()
     conn.close()
-    sincronizar_con_excel()
     return gasto_id
 
-def insertar_gastos_lote(lista_gastos, usuario_default="Principal"):
-    """Inserta múltiples gastos asignados al usuario seleccionado."""
+def insertar_gastos_lote(lista_gastos, usuario_default="Principal", user_id=None, grupo_id=None, visibilidad_default="familiar"):
     if not lista_gastos:
         return 0
     conn = get_connection()
@@ -217,30 +437,40 @@ def insertar_gastos_lote(lista_gastos, usuario_default="Principal"):
         cuot_val = str(g.get("cuotas", "1"))
         orig_val = str(g.get("origen", "Resumen Tarjeta"))
         not_val = str(g.get("notas", ""))
+        vis_val = g.get("visibilidad") or visibilidad_default
 
         if es_postgres():
             cursor.execute("""
-            INSERT INTO gastos (fecha, comercio, monto, moneda, categoria, medio_pago, cuotas, origen, notas, usuario)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
-            """, (f_val, c_val, m_val, mon_val, cat_val, mp_val, cuot_val, orig_val, not_val, u))
+            INSERT INTO gastos (fecha, comercio, monto, moneda, categoria, medio_pago, cuotas, origen, notas, usuario, user_id, grupo_id, visibilidad)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+            """, (f_val, c_val, m_val, mon_val, cat_val, mp_val, cuot_val, orig_val, not_val, u, user_id, grupo_id, vis_val))
         else:
             cursor.execute("""
-            INSERT INTO gastos (fecha, comercio, monto, moneda, categoria, medio_pago, cuotas, origen, notas, usuario)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-            """, (f_val, c_val, m_val, mon_val, cat_val, mp_val, cuot_val, orig_val, not_val, u))
+            INSERT INTO gastos (fecha, comercio, monto, moneda, categoria, medio_pago, cuotas, origen, notas, usuario, user_id, grupo_id, visibilidad)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """, (f_val, c_val, m_val, mon_val, cat_val, mp_val, cuot_val, orig_val, not_val, u, user_id, grupo_id, vis_val))
         count += 1
 
     conn.commit()
     conn.close()
-    sincronizar_con_excel()
     return count
 
-def obtener_gastos_df(mes=None, anio=None, categoria=None, medio_pago=None, usuario=None):
-    """Obtiene los gastos con filtros, incluyendo filtro por miembro o 'Todos'."""
+def obtener_gastos_df(user_id, grupo_id=None, modo="personal", mes=None, anio=None, categoria=None, medio_pago=None, usuario=None):
+    """
+    Obtiene los gastos según el contexto:
+    - modo 'personal': Solo los gastos del user_id (tanto privados como familiares de él).
+    - modo 'familiar': Si está en un grupo, muestra todos los gastos marcados como 'familiar' de los miembros del grupo.
+    """
     conn = get_connection()
     placeholder = "%s" if es_postgres() else "?"
-    query = "SELECT id, fecha, comercio, monto, moneda, categoria, medio_pago, cuotas, origen, notas, usuario, created_at FROM gastos WHERE 1=1"
     params = []
+
+    if modo == "familiar" and grupo_id:
+        query = f"SELECT id, fecha, comercio, monto, moneda, categoria, medio_pago, cuotas, origen, notas, usuario, visibilidad, created_at FROM gastos WHERE (grupo_id = {placeholder} AND visibilidad = 'familiar')"
+        params.append(grupo_id)
+    else:
+        query = f"SELECT id, fecha, comercio, monto, moneda, categoria, medio_pago, cuotas, origen, notas, usuario, visibilidad, created_at FROM gastos WHERE (user_id = {placeholder} OR (usuario = 'Principal' AND user_id IS NULL))"
+        params.append(user_id)
 
     if anio:
         if es_postgres():
@@ -280,110 +510,26 @@ def obtener_gastos_df(mes=None, anio=None, categoria=None, medio_pago=None, usua
             df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce").dt.strftime("%Y-%m-%d").fillna(df["fecha"])
     return df
 
-def obtener_ultimos_gastos(limit=5, usuario=None):
-    """Devuelve los últimos gastos filtrados por usuario o familiares."""
-    conn = get_connection()
-    placeholder = "%s" if es_postgres() else "?"
-    if usuario and usuario != "Todos":
-        query = f"SELECT id, fecha, comercio, monto, moneda, categoria, medio_pago, usuario FROM gastos WHERE usuario = {placeholder} ORDER BY fecha DESC, id DESC LIMIT {placeholder};"
-        df = pd.read_sql_query(query, conn, params=[usuario, limit])
-    else:
-        query = f"SELECT id, fecha, comercio, monto, moneda, categoria, medio_pago, usuario FROM gastos ORDER BY fecha DESC, id DESC LIMIT {placeholder};"
-        df = pd.read_sql_query(query, conn, params=[limit])
-    conn.close()
-    if not df.empty and "monto" in df.columns:
-        df["monto"] = pd.to_numeric(df["monto"], errors="coerce").fillna(0.0)
-    return df
+def obtener_ultimos_gastos(user_id, grupo_id=None, modo="personal", limit=5):
+    """Devuelve los últimos movimientos para el feed principal."""
+    df = obtener_gastos_df(user_id, grupo_id, modo=modo)
+    if not df.empty:
+        return df.head(limit)
+    return pd.DataFrame()
 
-def eliminar_gasto(gasto_id):
+def eliminar_gasto(gasto_id, user_id=None):
+    """Elimina un gasto asegurando permisos."""
     conn = get_connection()
     cursor = conn.cursor()
     if es_postgres():
-        cursor.execute("DELETE FROM gastos WHERE id = %s;", (gasto_id,))
+        if user_id:
+            cursor.execute("DELETE FROM gastos WHERE id = %s AND (user_id = %s OR user_id IS NULL);", (gasto_id, user_id))
+        else:
+            cursor.execute("DELETE FROM gastos WHERE id = %s;", (gasto_id,))
     else:
         cursor.execute("DELETE FROM gastos WHERE id = ?;", (gasto_id,))
     conn.commit()
     conn.close()
-    sincronizar_con_excel()
 
-def sincronizar_con_excel():
-    """Genera el Excel consolidado y con pestañas individuales por miembro."""
-    try:
-        conn = get_connection()
-        df_todos = pd.read_sql_query(
-            "SELECT id, fecha, comercio, monto, moneda, categoria, medio_pago, cuotas, usuario, origen, notas FROM gastos ORDER BY fecha DESC;",
-            conn
-        )
-        conn.close()
-
-        if not df_todos.empty and "monto" in df_todos.columns:
-            df_todos["monto"] = pd.to_numeric(df_todos["monto"], errors="coerce").fillna(0.0)
-
-        with pd.ExcelWriter(EXCEL_FILE, engine='openpyxl') as writer:
-            df_todos.to_excel(writer, index=False, sheet_name="Consolidado Familiar")
-            if not df_todos.empty and "usuario" in df_todos.columns:
-                usuarios_con_gastos = df_todos["usuario"].dropna().unique()
-                for u in usuarios_con_gastos:
-                    df_u = df_todos[df_todos["usuario"] == u]
-                    nombre_hoja = str(u)[:30]
-                    df_u.to_excel(writer, index=False, sheet_name=nombre_hoja)
-    except Exception as e:
-        print(f"Advertencia al sincronizar con Excel: {e}")
-
-def importar_desde_dataframe(df, col_fecha, col_comercio, col_monto, col_categoria=None, col_medio_pago=None, col_notas=None, usuario="Principal"):
-    """Importa gastos históricos asignándolos al usuario correspondiente."""
-    gastos_a_insertar = []
-    hoy = datetime.now().strftime("%Y-%m-%d")
-    
-    for _, row in df.iterrows():
-        fecha_raw = row.get(col_fecha, hoy)
-        try:
-            fecha_val = pd.to_datetime(fecha_raw).strftime("%Y-%m-%d")
-        except Exception:
-            fecha_val = hoy
-            
-        comercio_val = str(row.get(col_comercio, "Gasto Histórico")).strip()
-        if not comercio_val or comercio_val.lower() == "nan":
-            comercio_val = "Sin Nombre"
-            
-        monto_raw = row.get(col_monto, 0.0)
-        try:
-            if isinstance(monto_raw, str):
-                monto_clean = monto_raw.replace("$", "").replace(" ", "").replace(".", "").replace(",", ".")
-                monto_val = abs(float(monto_clean))
-            else:
-                monto_val = abs(float(monto_raw))
-        except Exception:
-            monto_val = 0.0
-            
-        if monto_val <= 0:
-            continue
-            
-        cat_val = str(row.get(col_categoria, "Otros")).strip() if col_categoria else "Otros"
-        if cat_val not in CATEGORIAS_DEFAULT:
-            cat_val = "Otros"
-            
-        mp_val = str(row.get(col_medio_pago, "Efectivo")).strip() if col_medio_pago else "Efectivo"
-        if mp_val not in MEDIOS_PAGO_DEFAULT:
-            mp_val = "Efectivo"
-            
-        notas_val = str(row.get(col_notas, "Importado de Excel viejo")).strip() if col_notas else "Importado de Excel viejo"
-        if notas_val.lower() == "nan":
-            notas_val = ""
-
-        gastos_a_insertar.append({
-            "fecha": fecha_val,
-            "comercio": comercio_val,
-            "monto": monto_val,
-            "moneda": "ARS",
-            "categoria": cat_val,
-            "medio_pago": mp_val,
-            "cuotas": "1",
-            "origen": "Excel Histórico",
-            "notas": notas_val,
-            "usuario": usuario
-        })
-        
-    return insertar_gastos_lote(gastos_a_insertar, usuario_default=usuario)
-
+# Inicializar esquema
 init_db()
