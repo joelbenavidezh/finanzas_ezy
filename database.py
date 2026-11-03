@@ -153,6 +153,14 @@ def init_db():
         );
         """)
 
+        # Asegurar RLS activo en todas las tablas
+        cursor.execute("""
+        ALTER TABLE public.grupos_familiares ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.cuentas_usuarios ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.gastos ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.presupuestos ENABLE ROW LEVEL SECURITY;
+        """)
+
     else:
         # Modo SQLite Local
         cursor.execute("""
