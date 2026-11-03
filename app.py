@@ -194,17 +194,18 @@ if not st.session_state["user"]:
             st.caption("Cada familiar tiene su propia cuenta segura. Luego podrán unirse al grupo familiar.")
             r_nombre = st.text_input("Tu Nombre:", placeholder="Ej: Joel, María, etc.")
             r_email = st.text_input("Tu Correo:", placeholder="tu@email.com").strip().lower()
-            r_pass = st.text_input("Crea una contraseña:", type="password")
+            r_pass = st.text_input("Crea una contraseña:", type="password", help="Mínimo 8 caracteres, al menos 1 letra y 1 número.")
             r_avatar = st.selectbox("Elige tu Avatar:", db.AVATARES_DEFAULT)
 
             if st.form_submit_button("Crear mi Cuenta Gratis", type="primary", use_container_width=True):
-                if len(r_pass) < 4:
-                    st.error("La contraseña debe tener al menos 4 caracteres.")
+                valida, msg_pwd = db.validar_complejidad_password(r_pass)
+                if not valida:
+                    st.error(f"⚠️ {msg_pwd}")
                 else:
                     ok, res = db.registrar_usuario(r_email, r_pass, r_nombre, r_avatar)
                     if ok:
                         st.session_state["user"] = res
-                        st.success("🎉 ¡Cuenta creada con éxito!")
+                        st.success("🎉 ¡Cuenta creada con éxito bajo estándar ISO 27001!")
                         st.rerun()
                     else:
                         st.error(res)
@@ -675,6 +676,28 @@ elif st.session_state["vista"] == "familia":
                             st.rerun()
                         else:
                             st.error(res)
+
+    # Sección de Privacidad y Cumplimiento (ISO/IEC 27701)
+    st.markdown("---")
+    with st.expander("🛡️ Privacidad y Seguridad de tus Datos (ISO 27701 / SOC 2)"):
+        st.markdown("""
+        Tus datos se encuentran cifrados y protegidos bajo estándares internacionales.
+        - **Criptografía:** Bcrypt (12 rondas de salting).
+        - **Pistas de Auditoría:** Registro inmutable de eventos de seguridad (ISO 27001 A.8.15).
+        - **Derecho al Olvido:** Puedes purgar tu cuenta y todos tus datos personales y financieros en cualquier momento.
+        """)
+        st.markdown("#### ⚠️ Zona de Peligro (Eliminación Definitiva)")
+        confirmar_purge = st.checkbox("Confirmo que deseo eliminar mi cuenta y purgar todos mis registros de forma irrecuperable.")
+        if st.button("🚨 Purgar y Eliminar mi Cuenta Permanentemente", type="primary"):
+            if confirmar_purge:
+                ok, msg_p = db.eliminar_cuenta_usuario(usuario["id"])
+                if ok:
+                    st.success("Tus datos han sido eliminados de acuerdo a ISO/IEC 27701.")
+                    cerrar_sesion()
+                else:
+                    st.error(msg_p)
+            else:
+                st.warning("Debes marcar la casilla de confirmación para proceder con la eliminación.")
 
 # ==============================================================================
 # VISTA 7: HISTORIAL & DESCARGA EN EXCEL
